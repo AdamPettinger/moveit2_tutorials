@@ -10,6 +10,7 @@ set(THIS_PACKAGE_INCLUDE_DIRS
 )
 
 set(THIS_PACKAGE_INCLUDE_DEPENDS
+  affordance_primitives
   ament_cmake
   Boost
   control_msgs
