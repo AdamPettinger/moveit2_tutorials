@@ -199,6 +199,7 @@ int main(int argc, char** argv)
     move_group_interface.setPathConstraints(constraints_msg);
     move_group_interface.setPoseTarget(target_pose);
     move_group_interface.setPlanningTime(10.0);
+    move_group_interface.setPlannerId("PRMstarkConfigDefault");
 
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     auto success = (move_group_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
@@ -229,6 +230,12 @@ int main(int argc, char** argv)
   screw_constraints.push(constraint);
 
   constraint.origin.x += 0.1;
+  screw_constraints.push(constraint);
+
+  constraint.origin.x = 0;
+  constraint.origin.z = -0.25;
+  constraint.axis.z = 1;
+  constraint.axis.x = 0;
   screw_constraints.push(constraint);
 
   while (screw_constraints.size() > 0 && rclcpp::ok())
