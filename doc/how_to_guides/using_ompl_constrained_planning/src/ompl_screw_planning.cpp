@@ -7,6 +7,7 @@
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <std_msgs/msg/color_rgba.hpp>
 #include <affordance_primitives/msg_types.hpp>
+#include <affordance_primitives/screw_model/screw_axis.hpp>
 #include <affordance_primitives/screw_model/screw_execution.hpp>
 
 static const auto LOGGER = rclcpp::get_logger("ompl_screw_planning");
@@ -20,6 +21,7 @@ int main(int argc, char** argv)
   auto node = rclcpp::Node::make_shared("ompl_screw_planning_node", node_options);
 
   rclcpp::executors::SingleThreadedExecutor executor;
+  affordance_primitives::APScrewExecutor screw_exec(node);
   executor.add_node(node);
   auto spinner = std::thread([&executor]() { executor.spin(); });
 
@@ -78,49 +80,125 @@ int main(int argc, char** argv)
     Eigen::Quaterniond rot_quat(rot_mat);
     pose_to_display.orientation = tf2::toMsg(rot_quat);
 
+    moveit_visual_tools.publishArrow(pose_to_display);
+    moveit_visual_tools.trigger();
     return pose_to_display;
   };
 
-  // Runs one constraint test
-  auto plan_one_constraint = [get_relative_pose, get_screw_pose, &move_group_interface,
-                              &moveit_visual_tools](const affordance_primitives::ScrewStamped& screw_constraint) {
-    auto current_pose = move_group_interface.getCurrentPose();
-    auto screw_pose = get_screw_pose(screw_constraint);
+  // Uses the current pose and a screw axis to find a target pose. All inputs are given in the planning frame
+  auto get_target_pose = [&moveit_visual_tools, &screw_exec, &move_group_interface](
+                             const affordance_primitives::ScrewStamped& screw,
+                             const geometry_msgs::msg::PoseStamped& current_pose, const double theta) {
+    geometry_msgs::msg::PoseStamped target_pose = current_pose;
 
-    // We can also plan along a line. We can use the same pose as last time.
-    Eigen::Vector3d relative_translation(0.3, 0, 0);
-    Eigen::Isometry3d screw_pose_eig;
-    tf2::fromMsg(screw_pose, screw_pose_eig);
-    relative_translation = screw_pose_eig.linear() * relative_translation;
+    // Convert start pose to Eigen
+    Eigen::Isometry3d tf_planning_to_current;
+    tf2::fromMsg(current_pose.pose, tf_planning_to_current);
 
-    auto target_pose = get_relative_pose(relative_translation.x(), relative_translation.y(), relative_translation.z());
+    // We need to convert the screw axis to be in the current frame instead of the planning. Make a tf message
+    geometry_msgs::msg::TransformStamped tfmsg_planning_to_current;
+    tfmsg_planning_to_current.header.frame_id = current_pose.header.frame_id;
+    tfmsg_planning_to_current.child_frame_id = "start_pose";
+    tfmsg_planning_to_current.transform.rotation = current_pose.pose.orientation;
+    tfmsg_planning_to_current.transform.translation.x = current_pose.pose.position.x;
+    tfmsg_planning_to_current.transform.translation.y = current_pose.pose.position.y;
+    tfmsg_planning_to_current.transform.translation.z = current_pose.pose.position.z;
 
-    // Building on the previous constraint, we can make it a line, by also reducing the dimension of the box in the x-direction.
-    moveit_msgs::msg::PositionConstraint line_constraint;
-    line_constraint.header.frame_id = move_group_interface.getPoseReferenceFrame();
-    line_constraint.link_name = move_group_interface.getEndEffectorLink();
-    shape_msgs::msg::SolidPrimitive line;
-    line.type = shape_msgs::msg::SolidPrimitive::BOX;
-    line.dimensions = { 1.0, 0.0005, 0.0005 };
-    line_constraint.constraint_region.primitives.emplace_back(line);
+    // Convert the screw message
+    const auto tfed_screw_message = affordance_primitives::transformScrew(screw, tfmsg_planning_to_current);
 
-    geometry_msgs::msg::Pose line_pose;
-    line_pose.position = current_pose.pose.position;
-    line_pose.orientation = screw_pose.orientation;
-    line_constraint.constraint_region.primitive_poses.emplace_back(line_pose);
-    line_constraint.weight = 1.0;
+    // Create a screw axis from the message
+    affordance_primitives::ScrewAxis screw_axis;
+    screw_axis.setScrewAxis(tfed_screw_message);
 
-    // Visualize the constraint
-    moveit_visual_tools.publishLine(current_pose.pose.position, target_pose.pose.position,
-                                    rviz_visual_tools::TRANSLUCENT_DARK);
-    moveit_visual_tools.publishArrow(screw_pose);
+    // Now calculate the target pose
+    Eigen::Isometry3d tf_planning_to_target = tf_planning_to_current * screw_axis.getTF(theta);
+    target_pose.pose = tf2::toMsg(tf_planning_to_target);
+
+    // Visualize the start and end poses
+    moveit_visual_tools.publishSphere(current_pose.pose, rviz_visual_tools::RED, 0.05);
+    moveit_visual_tools.publishSphere(target_pose.pose, rviz_visual_tools::GREEN, 0.05);
+
+    // Get path waypoints for visualization
+    affordance_primitives::AffordancePrimitiveGoal ap_goal;
+
+    // Set AP Goal with tf
+    geometry_msgs::msg::TransformStamped tf_ee_to_task = tf2::eigenToTransform(tf_planning_to_current.inverse());
+    tf_ee_to_task.header.frame_id = move_group_interface.getEndEffectorLink();
+    tf_ee_to_task.child_frame_id = move_group_interface.getPlanningFrame();
+    ap_goal.moving_frame_source = ap_goal.PROVIDED;
+    ap_goal.moving_to_task_frame = tf_ee_to_task;
+
+    ap_goal.theta_dot = 0.2;
+    ap_goal.screw_distance = theta;
+    ap_goal.screw = screw;
+
+    // Get waypoints and visualize
+    auto waypoints = screw_exec.getTrajectoryCommands(ap_goal, 10);
+    if (waypoints.has_value())
+    {
+      EigenSTL::vector_Isometry3d waypoints_vec;
+      for (auto& wp : waypoints->trajectory)
+      {
+        Eigen::Isometry3d this_wp;
+        tf2::fromMsg(wp.pose, this_wp);
+        waypoints_vec.push_back(this_wp);
+      }
+      // moveit_visual_tools.publishPath(waypoints_vec, rviz_visual_tools::RED, rviz_visual_tools::XSMALL, "Screw path");
+      moveit_visual_tools.publishAxisPath(waypoints_vec, rviz_visual_tools::SMALL, "Screw path");
+    }
+    else
+    {
+      RCLCPP_ERROR(LOGGER, "\n\n\nWAYPOINTS NOT FOUND\n\n\n");
+    }
+
     moveit_visual_tools.trigger();
+    return target_pose;
+  };
 
-    moveit_msgs::msg::Constraints line_constraints;
-    line_constraints.position_constraints.emplace_back(line_constraint);
-    line_constraints.name = "use_equality_constraints";
-    move_group_interface.setPathConstraints(line_constraints);
+  // Converts the screw message to a constraints message
+  auto get_constraint_msg = [&move_group_interface](const geometry_msgs::msg::Pose& screw_pose,
+                                                    const geometry_msgs::msg::Pose& current_pose) {
+    moveit_msgs::msg::Constraints constraints_msg;
+
+    moveit_msgs::msg::PositionConstraint pos_constraint;
+    pos_constraint.header.frame_id = move_group_interface.getPoseReferenceFrame();
+    pos_constraint.link_name = move_group_interface.getEndEffectorLink();
+    pos_constraint.weight = 1.0;
+
+    // TODO: use the dimensions to set the pitch
+    shape_msgs::msg::SolidPrimitive solid_primitive;
+    solid_primitive.type = shape_msgs::msg::SolidPrimitive::BOX;
+    solid_primitive.dimensions = { 1.0, 1.0, 1.0 };
+    pos_constraint.constraint_region.primitives.emplace_back(solid_primitive);
+
+    // Add screw then starting pose to message
+    pos_constraint.constraint_region.primitive_poses.emplace_back(screw_pose);
+    pos_constraint.constraint_region.primitive_poses.emplace_back(current_pose);
+
+    // Return the whole message
+    constraints_msg.position_constraints.emplace_back(pos_constraint);
+    constraints_msg.name = "screw_constraint";
+    return constraints_msg;
+  };
+
+  // Runs one constraint test
+  auto plan_one_constraint = [get_target_pose, get_screw_pose, get_constraint_msg,
+                              &move_group_interface](const affordance_primitives::ScrewStamped& screw_constraint) {
+    const auto current_pose = move_group_interface.getCurrentPose();
+    const auto screw_pose = get_screw_pose(screw_constraint);
+
+    // Figure out the end pose (target)
+    const double theta = 0.5 * M_PI;
+    const auto target_pose = get_target_pose(screw_constraint, current_pose, theta);
+
+    // Get the constraint message
+    const auto constraints_msg = get_constraint_msg(screw_pose, current_pose.pose);
+
+    // Plan
+    move_group_interface.setPathConstraints(constraints_msg);
     move_group_interface.setPoseTarget(target_pose);
+    move_group_interface.setPlanningTime(10.0);
 
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     auto success = (move_group_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
@@ -150,6 +228,9 @@ int main(int argc, char** argv)
   constraint.axis.x = -1;
   screw_constraints.push(constraint);
 
+  constraint.origin.x += 0.1;
+  screw_constraints.push(constraint);
+
   while (screw_constraints.size() > 0 && rclcpp::ok())
   {
     moveit_visual_tools.prompt(
@@ -160,40 +241,6 @@ int main(int argc, char** argv)
     plan_one_constraint(screw_constraints.front());
     screw_constraints.pop();
   }
-
-  constraint.origin.x += 0.25;
-  screw_constraints.push(constraint);
-
-  affordance_primitives::APScrewExecutor screw_exec(node);
-  affordance_primitives::AffordancePrimitiveGoal ap_goal;
-
-  geometry_msgs::msg::TransformStamped tf_ee_to_task;
-  tf_ee_to_task.header.frame_id = move_group_interface.getEndEffectorLink();
-  tf_ee_to_task.child_frame_id = move_group_interface.getPlanningFrame();
-  tf_ee_to_task.transform.translation.x = -1 * current_pose.pose.position.x;
-  tf_ee_to_task.transform.translation.y = -1 * current_pose.pose.position.y;
-  tf_ee_to_task.transform.translation.z = -1 * current_pose.pose.position.z;
-
-  ap_goal.moving_frame_source = ap_goal.PROVIDED;
-  ap_goal.moving_to_task_frame = tf_ee_to_task;
-
-  ap_goal.screw = screw_constraints.front();
-  ap_goal.theta_dot = 0.2;
-  ap_goal.screw_distance = 0.25 * M_PI;
-
-  auto waypoints = screw_exec.getTrajectoryCommands(ap_goal, 10);
-  EigenSTL::vector_Isometry3d test;
-  for (auto& wp : waypoints->trajectory)
-  {
-    Eigen::Isometry3d this_wp;
-    tf2::fromMsg(wp.pose, this_wp);
-    test.push_back(this_wp);
-  }
-  auto screw_pose = get_screw_pose(screw_constraints.front());
-  moveit_visual_tools.publishArrow(screw_pose);
-  moveit_visual_tools.publishPath(test, rviz_visual_tools::RED, rviz_visual_tools::XSMALL, "Screw path");
-  moveit_visual_tools.publishAxisPath(test, rviz_visual_tools::SMALL, "Screw path");
-  moveit_visual_tools.trigger();
 
   // Done!
   moveit_visual_tools.prompt("Press 'Next' in the RvizVisualToolsGui window to clear the markers");
